@@ -1,0 +1,74 @@
+{
+  "api": 1,
+  "features": [
+    "sessions",
+    "keys",
+    "screen",
+    "term",
+    "reader2",
+    "fs",
+    "launchers",
+    "resume",
+    "events",
+    "network",
+    "approvals",
+    "relay",
+    "speedtest",
+    "links",
+    "linkproxy",
+    "goblin1"
+  ],
+  "goblin": 1,
+  "host_id": "1111111111111111",
+  "kinds": [
+    "claude",
+    "pi",
+    "shell"
+  ],
+  "launchers": [
+    {
+      "kind": "claude",
+      "label": "Claude",
+      "name": "claude",
+      "command": "claude",
+      "resume": "claude --continue",
+      "claude": true,
+      "accent": 1,
+      "icon": "cloud"
+    },
+    {
+      "kind": "pi",
+      "label": "Pi",
+      "name": "pi",
+      "command": "pi",
+      "resume": "pi --continue",
+      "claude": false,
+      "accent": 2,
+      "icon": "chip",
+      "process": "pi-coding-agent"
+    },
+    {
+      "kind": "shell",
+      "label": "Shell",
+      "name": "shell",
+      "command": "",
+      "claude": false,
+      "accent": 1,
+      "icon": "terminal"
+    }
+  ],
+  "links": {
+    "vigil": "http://192.168.1.10:30300"
+  },
+  "name": "linux-box",
+  "net": "1111111111111111",
+  "node_id": "1111111111111111",
+  "os": "linux",
+  "product": "goblin",
+  "proto": 2,
+  "roots": [
+    "/home/user"
+  ],
+  "version": "0.2.0",
+  "vigil": true
+}

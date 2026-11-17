@@ -1,0 +1,35 @@
+{
+  "features": [
+    "reader2",
+    "fs",
+    "goblin1",
+    "resume",
+    "network"
+  ],
+  "goblin": 1,
+  "host_id": "3333333333333333",
+  "kinds": [
+    "shell"
+  ],
+  "launchers": [
+    {
+      "kind": "shell",
+      "label": "Shell",
+      "name": "shell",
+      "command": "",
+      "claude": false,
+      "accent": 1,
+      "icon": "terminal"
+    }
+  ],
+  "name": "windows-arm",
+  "net": "1111111111111111",
+  "node_id": "3333333333333333",
+  "os": "windows",
+  "proto": 2,
+  "roots": [
+    "C:\\Users\\user"
+  ],
+  "version": "0.1.0",
+  "vigil": false
+}

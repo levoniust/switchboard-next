@@ -1,0 +1,284 @@
+import 'dart:async';
+
+import 'package:app_links/app_links.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import 'core/alert_service.dart';
+import 'core/api.dart';
+import 'core/desktop.dart';
+import 'core/hub.dart';
+import 'core/platform.dart';
+import 'core/settings.dart';
+import 'screens/alerts_screen.dart';
+import 'screens/pair_screen.dart';
+import 'screens/sessions_screen.dart';
+import 'screens/settings_screen.dart';
+import 'screens/terminal_screen.dart';
+import 'screens/vigil_screen.dart';
+import 'skins/chrome.dart';
+
+final settings = Settings();
+final hub = Fleet();
+final navKey = GlobalKey<NavigatorState>();
+final messengerKey = GlobalKey<ScaffoldMessengerState>();
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await settings.load();
+  await hub.load();
+  unawaited(hub.start());
+  if (isDesktop) unawaited(Desktop.instance.init());
+  if (hub.paired) unawaited(AlertService.start()); // Android: alerts while the app is closed
+  runApp(const SwitchboardApp());
+}
+
+void toast(String msg) => messengerKey.currentState
+  ?..hideCurrentSnackBar()
+  ..showSnackBar(SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating));
+
+class SwitchboardApp extends StatefulWidget {
+  const SwitchboardApp({super.key});
+  @override
+  State<SwitchboardApp> createState() => _SwitchboardAppState();
+}
+
+class _SwitchboardAppState extends State<SwitchboardApp> {
+  final _links = AppLinks();
+  StreamSubscription<Uri>? _linkSub;
+  StreamSubscription<String?>? _toastSub;
+  late final AppLifecycleListener _life;
+  String? _lastLink;
+  DateTime _lastLinkAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  bool _wasPaired = false;
+
+  /// Removed from the network (or "forget this device"): back to pairing.
+  void _pairedChanged() {
+    if (!_wasPaired && hub.paired) unawaited(AlertService.start());
+    if (_wasPaired && !hub.paired) unawaited(AlertService.stop());
+    if (_wasPaired && !hub.paired) {
+      navKey.currentState?.pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const PairScreen()), (_) => false);
+      toast('This device is no longer part of the network. Its key and offline copies were deleted.');
+    }
+    _wasPaired = hub.paired;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _wasPaired = hub.paired; // main() already started the alert service for a paired app
+    hub.addListener(_pairedChanged);
+    _linkSub = _links.uriLinkStream.listen(_onLink);
+    if (isDesktop) {
+      // A computer keeps the socket open in the background: unfocused or minimized only changes what the bridge
+      // is told (so the phone still gets pushes) and turns alerts into Windows toasts.
+      _life = AppLifecycleListener(onStateChange: (s) => hub.setWindowActive(s == AppLifecycleState.resumed));
+      _toastSub = Desktop.instance.clicks.listen((payload) {
+        final p = (payload ?? '').split('|'); // "node|pane"
+        final sess = p.length == 2 ? hub.sessionByPane(p[1], p[0]) : hub.sessionByPane(payload);
+        if (sess != null) openTerminal(sess);
+      });
+    } else {
+      _life = AppLifecycleListener(
+        onResume: () {
+          hub.resume();
+          AlertService.visible(true);
+        },
+        onPause: () {
+          hub.pause();
+          AlertService.visible(false);
+        },
+        onHide: () {
+          hub.pause();
+          AlertService.visible(false);
+        },
+        onShow: () {
+          hub.resume();
+          AlertService.visible(true);
+        },
+      );
+      AlertService.visible(true);
+      // a tapped chat alert opens that chat ("node|pane")
+      _toastSub = AlertService.taps.stream.listen((payload) async {
+        final p = payload.split('|');
+        if (p.length != 2) return;
+        final sess = await hub.findSession(p[1], p[0]);
+        if (sess != null) {
+          openTerminal(sess);
+        } else {
+          toast('That chat has ended.');
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _linkSub?.cancel();
+    _toastSub?.cancel();
+    _life.dispose();
+    super.dispose();
+  }
+
+  /// Deep links: `goblin://pair/PAYLOAD`, `alert/ID`, `answer/ID/KEY`, `session/PANE`, `vigil`.
+  /// `?node=ID` picks the machine (pushes from 1.3 nodes); without it, the first machine (older pushes).
+  Future<void> _onLink(Uri uri) async {
+    final s = uri.toString();
+    // the initial link can arrive twice; the same notification tapped again later must still work
+    final now = DateTime.now();
+    if (s == _lastLink && now.difference(_lastLinkAt) < const Duration(seconds: 2)) return;
+    _lastLink = s;
+    _lastLinkAt = now;
+    final parts = [uri.host, ...uri.pathSegments].where((p) => p.isNotEmpty).toList();
+    final nodeId = uri.queryParameters['node'];
+    if (parts.isEmpty) return;
+    switch (parts.first) {
+      case 'pair':
+        final server = Server.fromPairLink(s);
+        if (server == null) return toast('That pairing link is damaged.');
+        navKey.currentState?.push(MaterialPageRoute(builder: (_) => PairScreen(initial: server)));
+        break;
+      case 'alert':
+        await _openAlert(int.tryParse(parts.length > 1 ? parts[1] : '') ?? 0, nodeId);
+        break;
+      case 'answer':
+        final id = parts.length < 3 ? null : int.tryParse(parts[1]);
+        if (id == null) return toast('That link is damaged.');
+        await _waitOnline(nodeId);
+        final node = hub.node(nodeId);
+        if (node == null) return toast('That machine is not paired with this app.');
+        try {
+          final label = await node.answer(id, parts[2]);
+          toast('Answered: $label');
+        } catch (e) {
+          toast('Could not answer: $e');
+        }
+        await _openAlert(id, nodeId);
+        break;
+      case 'session':
+        await _waitOnline(nodeId);
+        final sess = hub.sessionById(Uri.decodeComponent(parts.length > 1 ? parts[1] : ''), nodeId);
+        if (sess != null) openTerminal(sess);
+        break;
+      case 'vigil':
+        navKey.currentState?.push(MaterialPageRoute(builder: (_) => const VigilScreen(standalone: true)));
+        break;
+    }
+  }
+
+  Future<void> _waitOnline([String? nodeId]) async {
+    for (var i = 0; i < 40 && (hub.node(nodeId)?.link ?? hub.link) != LinkState.online; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+  }
+
+  Future<void> _openAlert(int id, [String? nodeId]) async {
+    await _waitOnline(nodeId);
+    final node = hub.node(nodeId);
+    if (node == null) return toast('That machine is not paired with this app.');
+    try {
+      final a = await node.alert(id);
+      final sess = node.sessionByPane(a.pane);
+      if (sess != null) {
+        openTerminal(sess);
+      } else {
+        navKey.currentState?.push(MaterialPageRoute(builder: (_) => const AlertsScreen(standalone: true)));
+      }
+    } catch (e) {
+      toast('Alert not found: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (context, _) {
+        final skin = settings.skin;
+        if (isPhone) {
+          SystemChrome.setSystemUIOverlayStyle(skin.brightness == Brightness.dark
+              ? SystemUiOverlayStyle.light.copyWith(statusBarColor: Colors.transparent)
+              : SystemUiOverlayStyle.dark.copyWith(statusBarColor: Colors.transparent));
+        }
+        return MaterialApp(
+          title: 'Switchboard',
+          debugShowCheckedModeBanner: false,
+          navigatorKey: navKey,
+          scaffoldMessengerKey: messengerKey,
+          theme: skin.theme,
+          home: hub.paired ? const HomeScreen() : const PairScreen(),
+        );
+      },
+    );
+  }
+}
+
+void openTerminal(Session s) {
+  navKey.currentState?.popUntil((r) => r.isFirst);
+  navKey.currentState?.push(MaterialPageRoute(builder: (_) => TerminalScreen(sessionId: s.id, nodeId: s.node?.id)));
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int tab = 0;
+  StreamSubscription<Alert>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = hub.newAlerts.listen((a) {
+      // Foreground: a banner instead of a phone notification (the bridge doesn't push while the app is open).
+      if (isDesktop && !hub.windowActive) Desktop.instance.toast(a).ignore();
+      if (!mounted || a.type == 'done' && ModalRoute.of(context)?.isCurrent != true) return;
+      final who = a.sessionName ?? 'Claude';
+      messengerKey.currentState?.showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: a.needsAnswer ? 10 : 4),
+        content: Text('$who: ${a.title}${a.body.isNotEmpty ? ' — ${a.body}' : ''}', maxLines: 3, overflow: TextOverflow.ellipsis),
+        action: SnackBarAction(label: 'OPEN', onPressed: () {
+          final s = hub.sessionFor(a);
+          if (s != null) openTerminal(s);
+        }),
+      ));
+      if (settings.haptics) HapticFeedback.mediumImpact();
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final skin = settings.skin;
+    final pages = [const SessionsScreen(), const AlertsScreen(), const VigilScreen(), const SettingsScreen()];
+    return ListenableBuilder(
+      listenable: hub,
+      builder: (context, _) => Scaffold(
+        body: SkinBackground(skin: skin, child: IndexedStack(index: tab, children: pages)),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: tab,
+          onDestinationSelected: (i) => setState(() => tab = i),
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+          destinations: [
+            NavigationDestination(icon: const Icon(Icons.terminal), label: skin.head('Chats')),
+            NavigationDestination(
+              icon: Badge(isLabelVisible: hub.openCount > 0, label: Text('${hub.openCount}'), child: const Icon(Icons.notifications_outlined)),
+              label: skin.head('Alerts'),
+            ),
+            NavigationDestination(icon: const Icon(Icons.radar), label: skin.head('Vigil')),
+            NavigationDestination(icon: const Icon(Icons.tune), label: skin.head('Settings')),
+          ],
+        ),
+      ),
+    );
+  }
+}
